@@ -10,14 +10,9 @@ ENV/
 
 .env
 .env.*
-!.env.example
 
 .streamlit/secrets.toml
 
-*.faiss
-*.index
-
+*.log
 .DS_Store
 Thumbs.db
-
-*.log
