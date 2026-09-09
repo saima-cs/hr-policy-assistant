@@ -5,9 +5,9 @@ from sentence_transformers import SentenceTransformer
 from groq import Groq
 
 
-# =========================================================
-# PAGE CONFIG
-# =========================================================
+# ============================================================
+# CONFIGURATION
+# ============================================================
 
 st.set_page_config(
     page_title="HR Policy Assistant",
@@ -16,34 +16,33 @@ st.set_page_config(
 )
 
 
-# =========================================================
-# HEADER
-# =========================================================
+# ============================================================
+# TITLE
+# ============================================================
 
 st.title("📘 HR Policy Assistant")
-st.markdown(
-    "Upload an HR Policy PDF and ask questions using AI-powered RAG."
+st.write(
+    "Upload an HR Policy PDF and ask questions about the policy."
 )
 
+st.divider()
 
-# =========================================================
-# LOAD EMBEDDING MODEL
-# =========================================================
+
+# ============================================================
+# LOAD SENTENCE TRANSFORMER
+# ============================================================
 
 @st.cache_resource
-def load_model():
+def load_embedding_model():
     return SentenceTransformer("all-MiniLM-L6-v2")
 
 
-with st.spinner("Loading AI model..."):
-    model = load_model()
-
-
-# =========================================================
+# ============================================================
 # GROQ CLIENT
-# =========================================================
+# ============================================================
 
-def get_groq_client():
+@st.cache_resource
+def load_groq_client():
 
     try:
         api_key = st.secrets["GROQ_API_KEY"]
@@ -57,43 +56,44 @@ def get_groq_client():
         return None
 
 
-client = get_groq_client()
+# ============================================================
+# PDF EXTRACTION
+# ============================================================
 
+def extract_pdf(uploaded_file):
 
-# =========================================================
-# PDF TEXT EXTRACTION
-# =========================================================
-
-def extract_text_from_pdf(uploaded_file):
-
-    pdf_data = uploaded_file.getvalue()
+    pdf_bytes = uploaded_file.getvalue()
 
     document = fitz.open(
-        stream=pdf_data,
+        stream=pdf_bytes,
         filetype="pdf"
     )
 
     pages = []
 
-    for page_number, page in enumerate(document):
+    for page_number in range(len(document)):
 
-        text = page.get_text("text")
+        page = document[page_number]
 
-        if text and text.strip():
+        text = page.get_text("text").strip()
 
-            pages.append({
-                "page": page_number + 1,
-                "text": text.strip()
-            })
+        if text:
+
+            pages.append(
+                {
+                    "page": page_number + 1,
+                    "text": text
+                }
+            )
 
     document.close()
 
     return pages
 
 
-# =========================================================
-# CREATE TEXT CHUNKS
-# =========================================================
+# ============================================================
+# CHUNKING
+# ============================================================
 
 def create_chunks(pages):
 
@@ -112,25 +112,27 @@ def create_chunks(pages):
 
             end = start + chunk_size
 
-            chunk = text[start:end].strip()
+            chunk_text = text[start:end].strip()
 
-            if chunk:
+            if chunk_text:
 
-                chunks.append({
-                    "text": chunk,
-                    "page": page["page"]
-                })
+                chunks.append(
+                    {
+                        "text": chunk_text,
+                        "page": page["page"]
+                    }
+                )
 
             start += chunk_size - overlap
 
     return chunks
 
 
-# =========================================================
-# CREATE EMBEDDINGS
-# =========================================================
+# ============================================================
+# EMBEDDINGS
+# ============================================================
 
-def create_embeddings(chunks):
+def create_embeddings(chunks, model):
 
     texts = [
         chunk["text"]
@@ -147,11 +149,17 @@ def create_embeddings(chunks):
     return embeddings
 
 
-# =========================================================
-# SEARCH RELEVANT CHUNKS
-# =========================================================
+# ============================================================
+# RETRIEVAL
+# ============================================================
 
-def search_policy(question, chunks, embeddings):
+def retrieve_documents(
+    question,
+    chunks,
+    embeddings,
+    model,
+    top_k=5
+):
 
     question_embedding = model.encode(
         [question],
@@ -165,107 +173,123 @@ def search_policy(question, chunks, embeddings):
         question_embedding
     )
 
-    top_k = min(5, len(chunks))
+    number_of_results = min(
+        top_k,
+        len(chunks)
+    )
 
-    top_indices = np.argsort(
+    best_indices = np.argsort(
         similarities
-    )[-top_k:][::-1]
+    )[-number_of_results:][::-1]
 
     results = []
 
-    for index in top_indices:
+    for index in best_indices:
 
-        results.append({
-            "text": chunks[index]["text"],
-            "page": chunks[index]["page"],
-            "score": similarities[index]
-        })
+        results.append(
+            {
+                "text": chunks[index]["text"],
+                "page": chunks[index]["page"],
+                "score": float(similarities[index])
+            }
+        )
 
     return results
 
 
-# =========================================================
-# ASK GROQ
-# =========================================================
+# ============================================================
+# GROQ ANSWER
+# ============================================================
 
-def ask_groq(question, results):
+def generate_answer(
+    question,
+    results,
+    client
+):
 
     context = ""
 
     for result in results:
 
         context += (
-            f"\n\n--- Page {result['page']} ---\n"
+            f"\n\nPAGE {result['page']}:\n"
             f"{result['text']}"
         )
 
     prompt = f"""
 You are an HR Policy Assistant.
 
-Answer the user's question using ONLY the HR policy context below.
+Answer the question using ONLY the HR policy context below.
 
-Do not make up information.
+Rules:
+1. Do not invent information.
+2. Do not use outside knowledge.
+3. If the policy does not contain the answer, say:
+   "I could not find this information in the uploaded HR policy."
+4. Give a clear and concise answer.
+5. Mention the relevant policy page when useful.
 
-If the answer is not available in the uploaded policy, say:
-
-"I could not find this information in the uploaded HR policy."
-
-Keep the answer clear and easy to understand.
-
-HR POLICY:
+HR POLICY CONTEXT:
 {context}
 
-QUESTION:
+USER QUESTION:
 {question}
 """
 
     response = client.chat.completions.create(
-
         model="openai/gpt-oss-20b",
-
         messages=[
             {
                 "role": "system",
-                "content": (
-                    "You are a helpful HR policy assistant. "
-                    "Use only the provided policy context."
-                )
+                "content": "You answer questions strictly from the provided HR policy."
             },
             {
                 "role": "user",
                 "content": prompt
             }
         ],
-
         temperature=0.2,
-
         max_tokens=600
     )
 
     return response.choices[0].message.content
 
 
-# =========================================================
-# GROQ KEY CHECK
-# =========================================================
+# ============================================================
+# INITIALIZE
+# ============================================================
 
-if client is None:
+try:
 
-    st.error(
-        "⚠️ GROQ API key is missing."
-    )
+    embedding_model = load_embedding_model()
+
+except Exception as error:
+
+    st.error("❌ Could not load the embedding model.")
+
+    st.exception(error)
+
+    st.stop()
+
+
+groq_client = load_groq_client()
+
+
+if groq_client is None:
+
+    st.error("❌ Groq API key is missing.")
 
     st.info(
         "Go to Streamlit Cloud → Manage app → Settings → Secrets "
-        "and add your GROQ_API_KEY."
+        "and add GROQ_API_KEY."
     )
 
     st.stop()
 
 
-# =========================================================
-# PDF UPLOAD
-# =========================================================
+# ============================================================
+# FILE UPLOAD
+# ============================================================
 
 uploaded_file = st.file_uploader(
     "📄 Upload your HR Policy PDF",
@@ -273,21 +297,29 @@ uploaded_file = st.file_uploader(
 )
 
 
-# =========================================================
-# PROCESS PDF
-# =========================================================
+# ============================================================
+# MAIN APPLICATION
+# ============================================================
 
-if uploaded_file:
+if uploaded_file is None:
+
+    st.info(
+        "👆 Upload an HR Policy PDF to start."
+    )
+
+else:
 
     st.success(
         f"📄 Uploaded: {uploaded_file.name}"
     )
 
-    with st.spinner("Reading PDF..."):
+    # --------------------------------------------------------
+    # EXTRACT PDF
+    # --------------------------------------------------------
 
-        pages = extract_text_from_pdf(
-            uploaded_file
-        )
+    with st.spinner("Reading your HR Policy PDF..."):
+
+        pages = extract_pdf(uploaded_file)
 
     if not pages:
 
@@ -295,73 +327,103 @@ if uploaded_file:
             "❌ No readable text was found in this PDF."
         )
 
+        st.warning(
+            "If your PDF is scanned images, OCR may be required."
+        )
+
         st.stop()
 
-    st.success(
-        f"✅ Extracted text from {len(pages)} pages."
-    )
+    # --------------------------------------------------------
+    # CREATE CHUNKS
+    # --------------------------------------------------------
 
-    with st.spinner("Creating document chunks..."):
+    with st.spinner("Preparing policy information..."):
 
         chunks = create_chunks(pages)
 
-    st.success(
-        f"✅ Created {len(chunks)} text chunks."
-    )
+    if not chunks:
 
-    with st.spinner("Creating embeddings..."):
+        st.error(
+            "❌ Could not create text chunks from the PDF."
+        )
+
+        st.stop()
+
+    # --------------------------------------------------------
+    # CREATE EMBEDDINGS
+    # --------------------------------------------------------
+
+    with st.spinner("Creating document embeddings..."):
 
         embeddings = create_embeddings(
-            chunks
+            chunks,
+            embedding_model
         )
 
     st.success(
-        "✅ HR Policy is ready for questions!"
+        f"✅ Policy ready! {len(chunks)} sections indexed."
     )
 
     st.divider()
 
-    # =====================================================
-    # QUESTION BOX
-    # =====================================================
+    # --------------------------------------------------------
+    # QUESTION
+    # --------------------------------------------------------
 
     question = st.text_input(
-        "💬 Ask a question about the HR policy",
-        placeholder="Example: How many annual leaves are allowed?"
+        "💬 Ask a question",
+        placeholder="Example: How many annual leaves can an employee take?"
     )
 
     if question:
 
-        with st.spinner(
-            "🔎 Searching the HR policy..."
-        ):
+        # ----------------------------------------------------
+        # RETRIEVE
+        # ----------------------------------------------------
 
-            results = search_policy(
+        with st.spinner("🔎 Searching the HR policy..."):
+
+            results = retrieve_documents(
                 question,
                 chunks,
-                embeddings
+                embeddings,
+                embedding_model,
+                top_k=5
             )
 
-        with st.spinner(
-            "🤖 Generating answer..."
-        ):
+        # ----------------------------------------------------
+        # GENERATE ANSWER
+        # ----------------------------------------------------
 
-            answer = ask_groq(
-                question,
-                results
-            )
+        with st.spinner("🤖 Generating answer..."):
 
-        st.subheader("🤖 Answer")
+            try:
 
-        st.write(answer)
+                answer = generate_answer(
+                    question,
+                    results,
+                    groq_client
+                )
+
+                st.subheader("🤖 Answer")
+
+                st.write(answer)
+
+            except Exception as error:
+
+                st.error(
+                    "❌ Could not generate the answer."
+                )
+
+                st.exception(error)
+
+        # ----------------------------------------------------
+        # SOURCES
+        # ----------------------------------------------------
 
         st.divider()
 
-        # =================================================
-        # SOURCES
-        # =================================================
-
-        st.subheader("📚 Sources")
+        st.subheader("📚 Retrieved Sources")
 
         for number, result in enumerate(
             results,
@@ -372,28 +434,20 @@ if uploaded_file:
                 f"Source {number} — Page {result['page']}"
             ):
 
-                st.write(
-                    result["text"]
-                )
+                st.write(result["text"])
 
                 st.caption(
-                    f"Similarity: {result['score']:.3f}"
+                    f"Similarity score: {result['score']:.3f}"
                 )
 
-else:
 
-    st.info(
-        "👆 Upload an HR Policy PDF to begin."
-    )
-
-
-# =========================================================
+# ============================================================
 # FOOTER
-# =========================================================
+# ============================================================
 
 st.divider()
 
 st.caption(
-    "HR Policy Assistant • RAG • Streamlit • "
-    "Sentence Transformers • Groq"
+    "HR Policy Assistant | RAG | Streamlit | "
+    "Sentence Transformers | Groq"
 )
